@@ -9,7 +9,8 @@ from aiohttp import ClientSession
 from feedparser import parse
 
 from app.core import logger
-from app.utils import structure_to_dict, dict_to_structure, retry
+from app.utils import UrlUtils
+from app.utils import AlistUrlTreeUtils, retry
 from app.modules.alist import AlistClient, AlistStorage
 
 VIDEO_MINETYPE: Final = frozenset(("video/mp4", "video/x-matroska"))
@@ -145,16 +146,18 @@ class Ani2Alist:
             if storage:
                 logger.debug(f"发现存储器{self.__target_dir}，开始更新番剧")
                 addition_dict = storage.addition
-                url_dict = structure_to_dict(addition_dict.get("url_structure", {}))
+                url_dict = AlistUrlTreeUtils.structure2dict(
+                    addition_dict.get("url_structure", {})
+                )
 
                 if url_dict.get(folder) is None:
                     url_dict[folder] = {}
 
-                url_dict[folder] = merge_dicts(
-                    url_dict[folder], anime_dict
-                )
+                url_dict[folder] = merge_dicts(url_dict[folder], anime_dict)
 
-                addition_dict["url_structure"] = dict_to_structure(url_dict)
+                addition_dict["url_structure"] = AlistUrlTreeUtils.dict2structure(
+                    url_dict
+                )
                 storage.change_addition(addition_dict)
 
                 await client.sync_api_admin_storage_update(storage)
@@ -189,7 +192,7 @@ class Ani2Alist:
         """
         folder = self.__get_folder
         logger.debug(f"开始获取ANI Open {folder} 动画列表")
-        url = f"https://{self.__src_domain}/{folder}/"
+        url = UrlUtils.encode(f"https://{self.__src_domain}/{folder}/")
 
         async with ClientSession() as session:
 
@@ -205,17 +208,21 @@ class Ani2Alist:
                     for file in _result["files"]:
                         mimeType: str = file["mimeType"]
                         name: str = file["name"]
+                        quoted_name = UrlUtils.encode(name)
 
                         if mimeType in FILE_MINETYPE:
                             size: int = file["size"]
-                            logger.debug(f"获取文件：{name}，文件大小：{size}")
+                            __url = _url + quoted_name + "?d=true"
+                            logger.debug(
+                                f"获取文件：{name}，文件大小：{int(size) / 1024 / 1024:.2f}MB，播放地址：{__url}"
+                            )
                             _anime_dict[name] = [
                                 size,
-                                f"{_url}{name}?d=true",
+                                __url,
                             ]
                         elif mimeType == "application/vnd.google-apps.folder":
                             logger.debug(f"获取目录：{name}")
-                            __url = _url + name + "/"
+                            __url = _url + quoted_name + "/"
                             _anime_dict[name] = await parse_data(__url)
                         else:
                             raise RuntimeError(

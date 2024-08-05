@@ -16,7 +16,8 @@ Alist2StrmList:
     raw_url: False                    # 是否使用原始地址替换 Alist 服务器下载地址（可选，默认 False）
     overwrite: False                  # 覆盖模式，本地路径存在同名文件时是否重新生成/下载该文件（可选，默认 False）
     other_ext:                        # 自定义下载后缀，使用西文半角逗号进行分割，（可选，默认为空）
-    max_workers: 5                    # 下载文件最大并发数（可选，默认 5）
+    max_workers: 50                   # 最大并发数，减轻对 Alist 服务器的负载（可选，默认 50）
+    max_downloaders: 5                 # 最大同时下载文件数（可选，默认 5）
     
   - id: 电影
     cron: 0 0 7 * *
@@ -45,4 +46,4 @@ Ani2AlistList:
     year: 2024                            # 动漫季度-年份，仅支持 2019-1 及以后更新的番剧（可选，默认使用当前日期）
     month: 7                              # 动漫季度-月份，仅支持 2019-1 及以后更新的番剧（可选，默认使用当前日期）
     src_domain: aniopen.an-i.workers.dev  # ANI Open 项目域名（可选，默认为 aniopen.an-i.workers.dev）
-    src_domain: api.ani.rip               # ANI Open 项目 RSS 订阅域名（可选，默认为 api.ani.rip） 
+    rss_domain: api.ani.rip               # ANI Open 项目 RSS 订阅域名（可选，默认为 api.ani.rip） 

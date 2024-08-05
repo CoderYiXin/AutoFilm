@@ -4,20 +4,14 @@
 from asyncio import to_thread, Semaphore, TaskGroup
 from os import PathLike
 from pathlib import Path
-from typing import Final
 
 from aiofile import async_open
 from aiohttp import ClientSession
 
 from app.core import logger
 from app.utils import retry
+from app.extensions import VIDEO_EXTS, SUBTITLE_EXTS, IMAGE_EXTS, NFO_EXTS
 from app.modules.alist import AlistClient, AlistPath
-
-
-VIDEO_EXTS: Final = frozenset(("mp4", "mkv", "flv", "avi", "wmv", "ts", "rmvb", "webm"))
-SUBTITLE_EXTS: Final = frozenset(("ass", "srt", "ssa", "sub"))
-IMAGE_EXTS: Final = frozenset(("png", "jpg"))
-NFO_EXTS: Final = frozenset(("nfo",))
 
 
 class Alist2Strm:
@@ -35,8 +29,9 @@ class Alist2Strm:
         nfo: bool = False,
         raw_url: bool = False,
         overwrite: bool = False,
-        other_ext: str | None = None,
-        max_workers: int = 5,
+        other_ext: str = "",
+        max_workers: int = 50,
+        max_downloaders: int = 5,
         **_,
     ) -> None:
         """
@@ -55,6 +50,7 @@ class Alist2Strm:
         :param overwrite: 本地路径存在同名文件时是否重新生成/下载该文件，默认为 False
         :param other_ext: 自定义下载后缀，使用西文半角逗号进行分割，默认为空
         :param max_worders: 最大并发数
+        :param max_downloaders: 最大同时下载
         """
         self.url = url
         self.username = username
@@ -75,38 +71,89 @@ class Alist2Strm:
             download_exts |= IMAGE_EXTS
         if nfo:
             download_exts |= NFO_EXTS
-        self.download_exts = download_exts
-
         if other_ext:
-            download_exts |= frozenset(other_ext.split(","))
+            download_exts |= frozenset(other_ext.lower().split(","))
+
+        self.download_exts = download_exts
+        self.process_file_exts = VIDEO_EXTS | download_exts
 
         self.overwrite = overwrite
-        self._async_semaphore = Semaphore(max_workers)
+        self.__max_workers = Semaphore(max_workers)
+        self.__max_downloaders = Semaphore(max_downloaders)
 
-    async def run(self, /):
+    async def run(self) -> None:
         """
         处理主体
         """
-        async with ClientSession() as session:
-            self.session = session
-            async with TaskGroup() as tg:
-                _create_task = tg.create_task
-                async with AlistClient(
-                    self.url, self.username, self.password
-                ) as client:
-                    async for path in client.iter_path(
-                        dir_path=self.source_dir,
-                        filter=lambda path: path.suffix
-                        in VIDEO_EXTS | self.download_exts,
-                    ):
-                        _create_task(self.__file_processer(path))
+
+        def filter(path: AlistPath) -> bool:
+            if path.is_dir:
+                return False
+
+            if not path.suffix.lower() in self.process_file_exts:
+                logger.debug(f"文件{path.name}不在处理列表中")
+                return False
+
+            if self.overwrite:
+                return True
+
+            local_path = self.get_local_path(path)
+
+            if local_path.exists():
+                logger.debug(f"文件{local_path.name}已存在，跳过处理{path.path}")
+                return False
+
+            return True
+
+        async with self.__max_workers:
+            async with ClientSession() as session:
+                self.session = session
+                async with TaskGroup() as tg:
+                    _create_task = tg.create_task
+                    async with AlistClient(
+                        self.url, self.username, self.password
+                    ) as client:
+                        async for path in client.iter_path(
+                            dir_path=self.source_dir, filter=filter
+                        ):
+                            _create_task(self.__file_processer(path))
+            logger.info("Alist2Strm处理完成")
 
     @retry(Exception, tries=3, delay=3, backoff=2, logger=logger)
-    async def __file_processer(self, /, path: AlistPath):
+    async def __file_processer(self, path: AlistPath) -> None:
         """
         异步保存文件至本地
 
         :param path: AlistPath 对象
+        """
+        local_path = self.get_local_path(path)
+
+        url = path.raw_url if self.raw_url else path.download_url
+
+        try:
+            _parent = local_path.parent
+            if not _parent.exists():
+                await to_thread(_parent.mkdir, parents=True, exist_ok=True)
+
+            logger.debug(f"开始处理{local_path}")
+            if local_path.suffix == ".strm":
+                async with async_open(local_path, mode="w", encoding="utf-8") as file:
+                    await file.write(url)
+                logger.info(f"{local_path.name}创建成功")
+            else:
+                async with self.__max_downloaders:
+                    async with async_open(local_path, mode="wb") as file:
+                        _write = file.write
+                        async with self.session.get(path.raw_url) as resp:
+                            async for chunk in resp.content.iter_chunked(1024):
+                                await _write(chunk)
+                    logger.info(f"{local_path.name}下载成功")
+        except Exception as e:
+            raise RuntimeError(f"{local_path}处理失败，详细信息：{e}")
+
+    def get_local_path(self, path: AlistPath) -> Path:
+        """
+        根据给定的 AlistPath 对象和当前的配置，计算出本地文件路径。
         """
         if self.flatten_mode:
             local_path = self.target_dir / path.name
@@ -115,31 +162,7 @@ class Alist2Strm:
                 self.source_dir, "", 1
             ).lstrip("/")
 
-        url = path.raw_url if self.raw_url else path.download_url
+        if path.suffix.lower() in VIDEO_EXTS:
+            local_path = local_path.with_suffix(".strm")
 
-        async with self._async_semaphore:
-            try:
-                if local_path.exists() and not self.overwrite:
-                    logger.debug(f"跳过文件：{local_path.name}")
-                    return
-
-                _parent = local_path.parent
-                if not _parent.exists():
-                    await to_thread(_parent.mkdir, parents=True, exist_ok=True)
-
-                if path.suffix in VIDEO_EXTS:
-                    local_path = local_path.with_suffix(".strm")
-                    async with async_open(
-                        local_path, mode="w", encoding="utf-8"
-                    ) as file:
-                        await file.write(url)
-                    logger.debug(f"创建文件：{local_path}")
-                else:
-                    async with async_open(local_path, mode="wb") as file:
-                        _write = file.write
-                        async with self.session.get(url) as resp:
-                            async for chunk in resp.content.iter_chunked(1024):
-                                await _write(chunk)
-                    logger.debug(f"下载文件：{local_path.name}")
-            except:
-                raise RuntimeError(f"下载失败: {local_path.name}")
+        return local_path
